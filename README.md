@@ -1,4 +1,4 @@
-# Assessment: Data & AI Product Engineer
+# Data-AI-Product-Engineer-Technical_Assessment
 
 This repository contains two tasks:
 - Task 1: Marketing Performance Assistant — Product Scoping
