@@ -1,10 +1,9 @@
 # Product Brief: Marketing Performance Assistant (MPA)
 
 **Version:** 1.0 Draft  
-**Author:** [Your Name]  
+**Author:** BALAJI V  
 **Date:** May 2026  
-**Status:** Scoping — not yet approved for build
-
+**Status:** Draft for review
 ---
 
 ## The Problem (In Plain Language)
