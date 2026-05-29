@@ -1,121 +1,139 @@
-import os
+"""
+main.py
+-------
+Entry point for the marketing weather pipeline.
+
+Run this script to execute one full pipeline cycle:
+    1. Fetch weather data for all configured cities
+    2. Transform and enrich the data
+    3. Load into BigQuery
+
+Usage:
+    python main.py
+
+    # With custom log level:
+    LOG_LEVEL=DEBUG python main.py
+
+    # Dry run (fetch + transform only, no BigQuery load):
+    python main.py --dry-run
+
+Exit codes:
+    0 = pipeline completed successfully
+    1 = pipeline completed with errors (partial failure)
+    2 = pipeline failed entirely (nothing loaded)
+"""
+
+import argparse
 import logging
-from datetime import datetime, timezone
+import sys
+import time
+from datetime import datetime
 
-import pandas as pd
-import requests
-from dotenv import load_dotenv
-from google.cloud import bigquery
-
-load_dotenv()
-
-logging.basicConfig(
-    filename="logs/pipeline.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-API_URL = "https://api.open-meteo.com/v1/forecast"
-
-CITIES = [
-    {"city": "Chennai", "latitude": 13.0827, "longitude": 80.2707},
-    {"city": "Bengaluru", "latitude": 12.9716, "longitude": 77.5946},
-]
-
-HOURLY_FIELDS = "temperature_2m,relative_humidity_2m,wind_speed_10m"
-
-BQ_PROJECT_ID = os.getenv("BQ_PROJECT_ID")
-BQ_DATASET_ID = os.getenv("BQ_DATASET_ID")
-BQ_TABLE_ID = os.getenv("BQ_TABLE_ID")
+from config import LOG_DATE_FORMAT, LOG_FORMAT, LOG_LEVEL
+from fetch import fetch_all_locations
+from load import load_to_bigquery
+from transform import transform_all
 
 
-def fetch_weather(city):
-    params = {
-        "latitude": city["latitude"],
-        "longitude": city["longitude"],
-        "hourly": HOURLY_FIELDS,
-        "timezone": "Asia/Kolkata"
-    }
-    try:
-        logging.info(f"Fetching data for {city['city']}")
-        response = requests.get(API_URL, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logging.error(f"API error for {city['city']}: {e}")
-        return None
-
-
-def transform_data(city, payload):
-    if not payload or "hourly" not in payload:
-        return pd.DataFrame()
-
-    hourly = payload["hourly"]
-    df = pd.DataFrame(hourly)
-
-    df["city"] = city["city"]
-    df["latitude"] = city["latitude"]
-    df["longitude"] = city["longitude"]
-
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df["temperature_2m"] = pd.to_numeric(df["temperature_2m"], errors="coerce")
-    df["relative_humidity_2m"] = pd.to_numeric(df["relative_humidity_2m"], errors="coerce")
-    df["wind_speed_10m"] = pd.to_numeric(df["wind_speed_10m"], errors="coerce")
-
-    df = df.dropna(subset=["time", "temperature_2m"])
-
-    df["temp_band"] = pd.cut(
-        df["temperature_2m"],
-        bins=[-100, 20, 30, 100],
-        labels=["cool", "warm", "hot"]
+def setup_logging() -> None:
+    """Configure logging for the whole pipeline."""
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+        format=LOG_FORMAT,
+        datefmt=LOG_DATE_FORMAT,
+        handlers=[
+            # Console output — enough for running locally and reading in Cloud Scheduler logs
+            logging.StreamHandler(sys.stdout),
+        ],
     )
 
-    df["is_hot_hour"] = df["temperature_2m"] > 30
-    df["ingested_at"] = datetime.now(timezone.utc)
 
-    return df
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Marketing Weather Pipeline — fetch, transform, load to BigQuery"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run fetch and transform but skip BigQuery load. Useful for testing.",
+    )
+    return parser.parse_args()
 
 
-def load_to_bigquery(df):
+def run_pipeline(dry_run: bool = False) -> int:
+    """
+    Execute the full pipeline.
+
+    Returns:
+        int: Exit code (0 = success, 1 = partial, 2 = full failure)
+    """
+    start_time = time.time()
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info(f"Pipeline run started | run_id={run_id}")
+    if dry_run:
+        logger.info("DRY RUN MODE — BigQuery load will be skipped")
+    logger.info("=" * 60)
+
+    # -----------------------------------------------------------------------
+    # Step 1: Fetch
+    # -----------------------------------------------------------------------
+    logger.info("STEP 1: Fetching data from Open-Meteo API")
+
+    fetched = fetch_all_locations()
+
+    if not fetched:
+        logger.error("No data fetched. All locations failed. Exiting with code 2.")
+        return 2
+
+    logger.info(f"Fetch complete: {len(fetched)} location(s) successful")
+
+    # -----------------------------------------------------------------------
+    # Step 2: Transform
+    # -----------------------------------------------------------------------
+    logger.info("STEP 2: Transforming and enriching data")
+
+    df = transform_all(fetched)
+
     if df.empty:
-        logging.warning("No data to load into BigQuery.")
-        return
+        logger.error("Transformation produced no rows. Exiting with code 2.")
+        return 2
 
-    client = bigquery.Client(project=BQ_PROJECT_ID)
-    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}"
+    logger.info(f"Transform complete: {len(df)} rows ready for load")
 
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_APPEND"
-    )
+    # Quick preview for the logs — useful when running manually
+    logger.info(f"Sample of transformed data (first 2 rows):\n{df.head(2).to_string()}")
 
-    job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
-    job.result()
+    # -----------------------------------------------------------------------
+    # Step 3: Load
+    # -----------------------------------------------------------------------
+    if dry_run:
+        logger.info("STEP 3: Skipped (dry run). Would have loaded to BigQuery.")
+        load_ok = True
+    else:
+        logger.info("STEP 3: Loading to BigQuery")
+        load_ok = load_to_bigquery(df)
 
-    logging.info(f"Loaded {len(df)} rows to {table_id}")
+    # -----------------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------------
+    elapsed = round(time.time() - start_time, 2)
 
+    logger.info("=" * 60)
+    if load_ok:
+        logger.info(f"Pipeline run SUCCEEDED | run_id={run_id} | elapsed={elapsed}s")
+        exit_code = 0
+    else:
+        logger.error(f"Pipeline run FAILED at load step | run_id={run_id} | elapsed={elapsed}s")
+        exit_code = 2
+    logger.info("=" * 60)
 
-def main():
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("data", exist_ok=True)
-
-    frames = []
-
-    for city in CITIES:
-        payload = fetch_weather(city)
-        df = transform_data(city, payload)
-        if not df.empty:
-            frames.append(df)
-
-    if not frames:
-        logging.warning("No data returned from API.")
-        return
-
-    final_df = pd.concat(frames, ignore_index=True)
-
-    final_df.to_csv("data/transformed_sample.csv", index=False)
-
-    load_to_bigquery(final_df)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    setup_logging()
+    args = parse_args()
+    sys.exit(run_pipeline(dry_run=args.dry_run))
